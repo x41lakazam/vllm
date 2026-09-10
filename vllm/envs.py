@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_MOE_PEER_SCATTER_COMBINE: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -629,6 +630,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Fuse the cross-GPU MoE combine into the FlashInfer CuTe-DSL GEMM2
+    # finalize epilogue: instead of a reduce-scatter after the experts, GEMM2
+    # writes each (token, k_slot) row straight into the owning rank's combine
+    # buffer, overlapped with its own compute. Needs the flashinfer_cutedsl
+    # NVFP4 MoE backend, the allgather_reducescatter all2all backend, and
+    # ep_size > 1. Experimental.
+    "VLLM_MOE_PEER_SCATTER_COMBINE": lambda: bool(
+        int(os.getenv("VLLM_MOE_PEER_SCATTER_COMBINE", "0"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),

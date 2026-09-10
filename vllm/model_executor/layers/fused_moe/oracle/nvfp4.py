@@ -101,6 +101,16 @@ def backend_to_kernel_cls(
             FlashInferCuteDSLExperts,
         )
 
+        if envs.VLLM_MOE_PEER_SCATTER_COMBINE:
+            # GEMM2 scatters straight into the owning rank's combine buffer.
+            # Listed first so it wins when its _supports_parallel_config holds
+            # (ep_size > 1); the plain experts remain the fallback.
+            from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_peer_scatter_moe import (  # noqa: E501
+                FlashInferCuteDSLPeerScatterExperts,
+            )
+
+            return [FlashInferCuteDSLPeerScatterExperts, FlashInferCuteDSLExperts]
+
         return [FlashInferCuteDSLExperts]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED:
@@ -615,6 +625,28 @@ def make_nvfp4_moe_kernel(
     extra_kwargs = {}
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM and per_token_activation:
         extra_kwargs["per_token_activation"] = True
+
+    # The peer-scatter experts and its prepare/finalize share one symmetric
+    # combine buffer and one destination map, because GEMM2 does the combine
+    # and finalize only reads the result back.
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_peer_scatter import (  # noqa: E501
+        MoEPrepareAndFinalizePeerScatter,
+    )
+
+    if isinstance(prepare_finalize, MoEPrepareAndFinalizePeerScatter):
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_peer_scatter_moe import (  # noqa: E501
+            FlashInferCuteDSLPeerScatterExperts,
+        )
+
+        if issubclass(experts_cls, FlashInferCuteDSLPeerScatterExperts):
+            extra_kwargs["combine_state"] = prepare_finalize.combine_state
+        else:
+            raise ValueError(
+                "MoEPrepareAndFinalizePeerScatter requires "
+                "FlashInferCuteDSLPeerScatterExperts, but the oracle chose "
+                f"{experts_cls.__name__}. Its finalize() would read a combine "
+                "buffer nothing ever wrote."
+            )
 
     # Create Experts.
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:

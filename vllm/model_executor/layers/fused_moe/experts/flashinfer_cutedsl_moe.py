@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -115,6 +117,16 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def _extra_moe_kwargs(self) -> dict[str, Any]:
+        """Extra keyword arguments for the FlashInfer MoE call.
+
+        Empty for the plain experts. Subclasses that change how the kernel
+        finalizes -- for example the peer-scatter variant, which makes GEMM2
+        write each route into the owning rank's combine buffer -- override
+        this instead of duplicating apply().
+        """
+        return {}
+
     def workspace_shapes(
         self,
         M: int,
@@ -210,4 +222,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
                 MoEActivation.SILU if activation == MoEActivation.SITU else activation
             ),
             **swiglu_kwargs,
+            **self._extra_moe_kwargs(),
         )

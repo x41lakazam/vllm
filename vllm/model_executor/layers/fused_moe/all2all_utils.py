@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -160,6 +161,35 @@ def maybe_roundup_layer_hidden_size(
         )
 
     return hidden_size
+
+
+def peer_scatter_combine_supported(
+    moe: FusedMoEConfig,
+    use_monolithic: bool,
+) -> bool:
+    """Whether the cross-GPU combine can be fused into GEMM2's epilogue.
+
+    Opt-in and narrow on purpose. It needs the modular interface (the
+    monolithic one has no separate finalize step to shrink), more than one
+    expert-parallel rank to scatter to, and NVFP4, which is the only dtype the
+    CuTe-DSL GEMM2 finalize kernel implements.
+    """
+    if not envs.VLLM_MOE_PEER_SCATTER_COMBINE:
+        return False
+    if use_monolithic:
+        logger.warning_once(
+            "VLLM_MOE_PEER_SCATTER_COMBINE is set but the monolithic MoE "
+            "interface is in use; falling back to reduce-scatter combine."
+        )
+        return False
+    if moe.moe_parallel_config.ep_size <= 1:
+        logger.warning_once(
+            "VLLM_MOE_PEER_SCATTER_COMBINE is set but ep_size is %d; there is "
+            "no peer to scatter to, falling back to reduce-scatter combine.",
+            moe.moe_parallel_config.ep_size,
+        )
+        return False
+    return True
 
 
 def maybe_make_prepare_finalize(
@@ -343,11 +373,30 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
-        prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
-            use_monolithic=use_monolithic,
-            is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
-            num_dispatchers=all2all_manager.world_size,
-        )
+        if peer_scatter_combine_supported(moe, use_monolithic):
+            # Same all-gather dispatch, but the combine moves into GEMM2's
+            # epilogue, so finalize() waits and reduces locally instead of
+            # running a reduce-scatter.
+            from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_peer_scatter import (  # noqa: E501
+                MoEPrepareAndFinalizePeerScatter,
+                PeerScatterCombineState,
+            )
+
+            prepare_finalize = MoEPrepareAndFinalizePeerScatter(
+                combine_state=PeerScatterCombineState(
+                    top_k=moe.experts_per_token,
+                    hidden_dim=moe.hidden_dim,
+                    dtype=moe.in_dtype,
+                ),
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=all2all_manager.world_size,
+            )
+        else:
+            prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
+                use_monolithic=use_monolithic,
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=all2all_manager.world_size,
+            )
 
     elif moe.use_nixl_ep_kernels:
         assert quant_config is not None
